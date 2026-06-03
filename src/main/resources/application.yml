@@ -1,0 +1,43 @@
+spring:
+  application:
+    name: notification-delivery-service
+  datasource:
+    url: jdbc:h2:mem:notification;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH
+    username: sa
+    password:
+  sql:
+    init:
+      mode: always
+  h2:
+    console:
+      enabled: true
+  threads:
+    virtual:
+      enabled: true
+
+server:
+  port: 8088
+
+app:
+  worker:
+    enabled: true
+    scan-delay: 5s
+    batch-size: 20
+    lease: 30s
+    max-concurrency: 32
+  delivery:
+    default-max-attempts: 5
+    connect-timeout: 5s
+    request-timeout: 10s
+    initial-backoff: 60s
+    max-backoff: 1h
+    jitter-ratio: 0.2
+  security:
+    allow-local-targets: false
+    sources:
+      demo:
+        allowed-domains:
+          - example.com
+          - httpbin.org
+  crypto:
+    secret: change-me-32-byte-dev-secret-only

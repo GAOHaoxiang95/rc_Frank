@@ -1,0 +1,387 @@
+openapi: 3.0.3
+info:
+  title: API 通知投递服务
+  description: |
+    接收内部业务系统提交的外部 HTTP 通知请求，异步投递到目标供应商 API。
+
+    投递语义为 at-least-once：任务可能被重复投递，平台会自动透传
+    `X-Idempotency-Key` 给下游，调用方不能在 headers 里覆盖该 header。
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8088
+    description: Local dev server
+
+security:
+  - SourceSystem: []
+
+paths:
+  /notifications:
+    post:
+      summary: 提交通知任务
+      description: |
+        提交一个外部 HTTP 通知任务。服务落库成功后立即返回 notificationId，
+        后续由 worker 异步投递。
+
+        同一 `sourceSystem + idempotencyKey`：
+        - payload 一致：返回已有任务，`duplicate=true`
+        - payload 不一致：返回 `409 Conflict`
+      operationId: submitNotification
+      parameters:
+        - $ref: '#/components/parameters/SourceSystemHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitNotificationRequest'
+            examples:
+              postNotification:
+                summary: POST 外部通知
+                value:
+                  idempotencyKey: case-post-001
+                  targetUrl: https://httpbin.org/anything
+                  method: POST
+                  headers:
+                    Content-Type: application/json
+                  body: '{"orderId":"10001","event":"PAID"}'
+              getNotification:
+                summary: GET 外部通知
+                value:
+                  idempotencyKey: case-get-001
+                  targetUrl: https://httpbin.org/get?orderId=10001
+                  method: GET
+                  headers:
+                    Accept: application/json
+                  body: ''
+      responses:
+        '202':
+          description: 新任务已接收
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmitNotificationResponse'
+        '200':
+          description: 幂等重复提交，返回已有任务
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmitNotificationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /notifications/{id}:
+    get:
+      summary: 查询通知任务状态
+      operationId: getNotification
+      parameters:
+        - $ref: '#/components/parameters/SourceSystemHeader'
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          description: 通知任务状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /notifications/{id}/attempts:
+    get:
+      summary: 查询通知投递历史
+      operationId: listNotificationAttempts
+      parameters:
+        - $ref: '#/components/parameters/SourceSystemHeader'
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          description: 投递尝试列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AttemptResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /notifications/{id}/retry:
+    post:
+      summary: 人工重试 FAILED 通知任务
+      description: 只允许对 `FAILED` 状态的任务调用。调用后任务回到 `PENDING`。
+      operationId: retryNotification
+      parameters:
+        - $ref: '#/components/parameters/SourceSystemHeader'
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '202':
+          description: 已提交人工重试
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    SourceSystem:
+      type: apiKey
+      in: header
+      name: X-Source-System
+      description: 调用方系统标识。当前实现用该 header 推导 sourceSystem。
+
+  parameters:
+    SourceSystemHeader:
+      name: X-Source-System
+      in: header
+      required: true
+      description: 调用方系统标识，例如 `demo`。
+      schema:
+        type: string
+        example: demo
+
+    NotificationId:
+      name: id
+      in: path
+      required: true
+      description: 通知任务 ID。
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: 请求参数错误、URL 不合法、域名不在白名单或尝试覆盖平台保留 header
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+    Unauthorized:
+      description: 缺少或未知的 X-Source-System
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+    NotFound:
+      description: 任务不存在，或不属于当前 sourceSystem
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+    Conflict:
+      description: 同一 idempotencyKey 已存在，但 payload 不一致
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+  schemas:
+    SubmitNotificationRequest:
+      type: object
+      required:
+        - idempotencyKey
+        - targetUrl
+        - method
+      properties:
+        idempotencyKey:
+          type: string
+          minLength: 1
+          description: 调用方提供的幂等键，同一 sourceSystem 下唯一。
+          example: case-post-001
+        targetUrl:
+          type: string
+          format: uri
+          minLength: 1
+          description: 外部供应商 API 地址，必须满足 sourceSystem 的域名白名单和 SSRF 策略。
+          example: https://httpbin.org/anything
+        method:
+          type: string
+          description: 外部 HTTP 请求方法。
+          enum:
+            - GET
+            - POST
+            - PUT
+            - PATCH
+            - DELETE
+          example: POST
+        headers:
+          type: object
+          description: |
+            外部 HTTP 请求头。调用方不能设置 `X-Idempotency-Key`，
+            该 header 由平台自动透传。
+          additionalProperties:
+            type: string
+          example:
+            Content-Type: application/json
+        body:
+          type: string
+          description: 外部 HTTP 请求体。GET 请求建议为空，参数放在 targetUrl query string。
+          default: ''
+          example: '{"orderId":"10001","event":"PAID"}'
+        maxAttempts:
+          type: integer
+          minimum: 1
+          maximum: 20
+          description: 最大投递次数。不传时使用服务默认值。
+          example: 5
+
+    SubmitNotificationResponse:
+      type: object
+      required:
+        - notificationId
+        - status
+        - duplicate
+      properties:
+        notificationId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/NotificationStatus'
+        duplicate:
+          type: boolean
+          description: 是否命中幂等重复提交。
+      example:
+        notificationId: 4a9b4e29-8c17-457f-9922-1afad8f8ce61
+        status: PENDING
+        duplicate: false
+
+    NotificationResponse:
+      type: object
+      required:
+        - notificationId
+        - sourceSystem
+        - targetUrl
+        - method
+        - status
+        - attemptCount
+        - maxAttempts
+        - createdAt
+        - updatedAt
+      properties:
+        notificationId:
+          type: string
+          format: uuid
+        sourceSystem:
+          type: string
+          example: demo
+        targetUrl:
+          type: string
+          format: uri
+          example: https://httpbin.org/anything
+        method:
+          type: string
+          example: POST
+        status:
+          $ref: '#/components/schemas/NotificationStatus'
+        attemptCount:
+          type: integer
+          example: 1
+        maxAttempts:
+          type: integer
+          example: 5
+        nextAttemptAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: 下次可投递时间。终态任务可能为空。
+        lockedUntil:
+          type: string
+          format: date-time
+          nullable: true
+          description: PROCESSING 任务的租约到期时间。
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    AttemptResponse:
+      type: object
+      required:
+        - id
+        - attemptNo
+        - status
+        - latencyMs
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        attemptNo:
+          type: integer
+          example: 1
+        status:
+          type: string
+          enum:
+            - SUCCESS
+            - FAILED
+        responseStatus:
+          type: integer
+          nullable: true
+          description: 外部 HTTP 响应状态码。网络错误时为空。
+          example: 200
+        errorType:
+          type: string
+          nullable: true
+          example: HTTP_STATUS
+        errorDetail:
+          type: string
+          nullable: true
+          example: upstream returned 500
+        latencyMs:
+          type: integer
+          format: int64
+          example: 123
+        createdAt:
+          type: string
+          format: date-time
+
+    NotificationStatus:
+      type: string
+      enum:
+        - PENDING
+        - PROCESSING
+        - SUCCESS
+        - FAILED
+
+    ApiError:
+      type: object
+      required:
+        - timestamp
+        - status
+        - error
+        - details
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        status:
+          type: integer
+          example: 400
+        error:
+          type: string
+          example: Bad Request
+        details:
+          type: array
+          items:
+            type: string
+          example:
+            - targetUrl host is not allowed for source system
